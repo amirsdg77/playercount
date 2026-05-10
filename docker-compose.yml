@@ -1,0 +1,54 @@
+services:
+  api:
+    image: playercount:cpu
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE: cpu
+    ports:
+      - "8000:8000"
+    environment:
+      PLAYERCOUNT_LOG_JSON: "true"
+      PLAYERCOUNT_LOG_LEVEL: "INFO"
+      PLAYERCOUNT_DEVICE: "cpu"
+      PLAYERCOUNT_YOLO_WEIGHTS: "/app/models/yolov8m-soccer.pt"
+      PLAYERCOUNT_TEAMS_CLUSTERER_PATH: "/app/models/teams.joblib"
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8000/healthz', timeout=2).is_success else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # GPU variant — uncomment and run with `docker compose --profile gpu up`.
+  # Requires the NVIDIA Container Toolkit on the host.
+  api-gpu:
+    profiles: ["gpu"]
+    image: playercount:gpu
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE: gpu
+    ports:
+      - "8000:8000"
+    environment:
+      PLAYERCOUNT_LOG_JSON: "true"
+      PLAYERCOUNT_DEVICE: "cuda"
+      PLAYERCOUNT_YOLO_WEIGHTS: "/app/models/yolov8m-soccer.pt"
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+    restart: unless-stopped

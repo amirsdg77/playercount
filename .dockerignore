@@ -1,0 +1,37 @@
+# Trim the build context to keep `docker build` fast and the image small.
+.git
+.github
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+*.egg-info
+.eggs
+
+# Tooling caches
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.coverage
+htmlcov
+
+# Tests are never needed at runtime
+tests
+
+# Large local artifacts that would bloat the build context
+data
+models
+results
+out.ndjson
+out.json
+out.mp4
+*.log
+
+# IDE / OS noise
+.idea
+.vscode
+.DS_Store
+
+# Documentation that isn't needed in the image
+docs

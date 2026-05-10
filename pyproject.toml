@@ -1,0 +1,188 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "playercount"
+version = "0.1.0"
+description = "Per-team on-screen player counts from broadcast soccer video."
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["computer-vision", "soccer", "football", "object-detection", "tracking", "yolo", "siglip"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+dependencies = [
+    "av>=12,<14",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "typer>=0.12",
+    "structlog>=24.1",
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+    "pillow>=10.2",
+    "supervision>=0.20",
+    "scikit-learn>=1.4",
+    "umap-learn>=0.5.5",
+    "joblib>=1.3",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+# ---------------------------------------------------------------------------
+# torch wheel selection.
+# ----------------------------------
+# PyPI's default torch wheels include CUDA libraries, even on the "cpu"
+# extra. For a real CPU-only install (much smaller footprint, no GPU libs),
+# pass an extra index URL to pip:
+#
+#   pip install -e ".[cpu,dev]" --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# For CUDA 12.1 (matches our Dockerfile GPU base):
+#
+#   pip install -e ".[gpu,dev]" --extra-index-url https://download.pytorch.org/whl/cu121
+#
+# We don't pin the URL here because PEP 621 doesn't support per-extra index
+# URLs cleanly. Documenting the install command is the standard pattern.
+# ---------------------------------------------------------------------------
+cpu = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "ultralytics>=8.1",
+    "transformers>=4.40",
+]
+gpu = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "ultralytics>=8.1",
+    "transformers>=4.40",
+    "accelerate>=0.28",
+]
+serve = ["gunicorn>=21.2"]
+dev = [
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "pytest>=8.1",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "respx>=0.21",
+    "types-PyYAML",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/playercount"
+Issues = "https://github.com/example/playercount/issues"
+
+[project.scripts]
+playercount = "playercount.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/playercount"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/playercount", "configs", "README.md"]
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "I", "B", "UP", "N", "SIM", "RUF", "ASYNC",
+    "C4", "PIE", "RET", "TCH",
+]
+ignore = [
+    "E501",     # line length handled by formatter
+    "B008",     # FastAPI's Depends(...) idiom triggers this
+    "TC001",    # ``from __future__ import annotations`` already makes imports zero-cost
+    "TC002",    # same — no need to gate library imports behind TYPE_CHECKING
+    "TC003",    # same — no need to gate stdlib imports behind TYPE_CHECKING
+    "RUF001",   # we use Unicode arrows / quotes intentionally in docstrings
+    "RUF046",   # cast-to-int from float is intentional and documents intent
+    "C408",     # `dict(a=1)` is more readable than `{"a": 1}` in some contexts
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B", "SIM", "ASYNC230"]
+"src/playercount/api/routes.py" = ["B008", "ASYNC240"]  # Path.is_file is fast enough; anyio.Path is overkill
+"src/playercount/api/dependencies.py" = ["B008"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+packages = ["playercount"]
+# Many `type: ignore[import-not-found]` markers are preemptive — they cover
+# the case where `torch` / `ultralytics` / `transformers` / `cv2` / `av`
+# aren't installed in the lint environment (CI's [dev]-only install). On a
+# full [cpu,dev] or [gpu,dev] install they're unused. Treat that as fine.
+warn_unused_ignores = false
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = [
+    "av",
+    "av.*",
+    "cv2",
+    "supervision",
+    "supervision.*",
+    "ultralytics",
+    "ultralytics.*",
+    "umap",
+    "joblib",
+    "transformers",
+    "transformers.*",
+    "torch",
+    "torch.*",
+    "sklearn",
+    "sklearn.*",
+    "huggingface_hub",
+    "roboflow",
+]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "slow: requires sample.mp4 and downloaded model weights",
+]
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = [
+    "ignore::DeprecationWarning:google.*",
+    "ignore::DeprecationWarning:transformers.*",
+]
+
+[tool.coverage.run]
+source = ["src/playercount"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "\\.\\.\\.",
+]

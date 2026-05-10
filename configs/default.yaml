@@ -1,0 +1,28 @@
+# playercount default configuration overlay.
+#
+# Resolution order (last wins):
+#   1. defaults baked into playercount.config.Settings
+#   2. this file (loaded via PLAYERCOUNT_CONFIG_FILE or load_settings(path))
+#   3. PLAYERCOUNT_* environment variables
+#
+# Algorithmic tunables live here so they're version-controlled per experiment.
+# Deployment knobs (paths, device, log level) belong in environment variables.
+
+detection:
+  conf: 0.35              # min YOLO score to keep a detection
+  iou: 0.5                # NMS IoU threshold
+  yolo_batch_size: 8      # frames per YOLO forward pass
+
+team_id:
+  siglip_batch_size: 64   # crops per SigLIP forward pass
+  cluster_min_samples: 60 # minimum player crops before fitting the team clusterer
+  umap_components: 3      # dim of the UMAP-reduced space KMeans operates in
+  kmeans_random_state: 42 # determinism
+
+aggregation:
+  track_window: 30        # sliding-window length for per-track team-vote stabilization
+
+pipeline:
+  queue_maxsize: 8        # default upper bound for inter-stage queues
+  sampling_stride: 1      # process every Nth decoded frame (1 == all frames)
+  # executor_max_workers: 8  # uncomment to override the min(8, cpu+4) heuristic

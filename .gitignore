@@ -1,0 +1,72 @@
+# Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Virtualenvs -----------------------------------------------------------
+.venv/
+venv/
+env/
+.python-version
+
+# Tooling caches --------------------------------------------------------
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# IDEs ------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Project artifacts not committed --------------------------------------
+data/*.mp4
+data/*.mkv
+data/*.mov
+!data/.gitkeep
+models/*.pt
+models/*.onnx
+models/*.engine
+models/*.joblib
+!models/.gitkeep
+
+# Per-run outputs (results/ is the canonical destination) ---------------
+results/*
+!results/.gitkeep
+out.ndjson
+out.json
+out.mp4
+*.log
+
+# Generated documentation / presentation artifacts ----------------------
+# These are rebuilt on demand and should never land in the repo.
+*.pdf
+*_GUIDE.md
+*_GUIDE.html
+PRESENTATION_*.md
+STUDY_*.md
+STUDY_*.html
+# Rendered intermediates (e.g. when building a PDF from markdown)
+*.aux
+*.toc
+*.out
+*.lof
+*.lot
+*.synctex.gz
+
+# Env -------------------------------------------------------------------
+.env
+.env.local
