@@ -99,6 +99,8 @@ pip install -e ".[gpu,dev]" --extra-index-url https://download.pytorch.org/whl/c
 ### Pull weights
 
 ```bash
+python scripts/download_weights.py
+# or, if you have GNU Make:
 make download-weights
 ```
 
@@ -129,11 +131,12 @@ playercount calibrate data/sample.mp4 --frames 150 --out models/teams.joblib
 ### HTTP API
 
 ```bash
-# Dev: hot-reload on file changes.
-make serve
-
 # Production: uvicorn factory + the lifespan warms the model registry.
 python -m uvicorn playercount.api.main:create_app --factory --host 0.0.0.0 --port 8000
+
+# Dev: hot-reload on file changes.
+python -m uvicorn playercount.api.main:create_app --factory --reload --port 8000
+# or, with Make: make serve
 ```
 
 ```bash
@@ -151,13 +154,23 @@ curl -N -X POST -F file=@data/sample.mp4 localhost:8000/analyze/stream | head
 ### Docker
 
 ```bash
-make docker-build       # CPU image
-docker compose up api   # serve on :8000
+# Build + run the CPU image (serves on :8000):
+docker compose up --build api
 
-# GPU (requires the NVIDIA Container Toolkit on the host)
-make docker-build-gpu
-docker compose --profile gpu up api-gpu
+# GPU (requires the NVIDIA Container Toolkit on the host):
+docker compose --profile gpu up --build api-gpu
+
+# Or build directly without compose:
+docker build -t playercount:cpu --build-arg BASE=cpu .
+docker run --rm -p 8000:8000 \
+    -v "$PWD/models:/app/models:ro" \
+    -v "$PWD/data:/app/data:ro" \
+    playercount:cpu
 ```
+
+The image mounts `models/` and `data/` read-only and exposes the HTTP API
+on port 8000. With weights present, `/readyz` returns 200 once the model
+registry has finished warming.
 
 ---
 

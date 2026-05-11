@@ -40,10 +40,10 @@ help:
 
 .PHONY: install install-gpu
 install:
-	$(PIP) install -e ".[cpu,dev]"
+	$(PIP) install -e ".[cpu,dev]" --extra-index-url https://download.pytorch.org/whl/cpu
 
 install-gpu:
-	$(PIP) install -e ".[gpu,dev]"
+	$(PIP) install -e ".[gpu,dev]" --extra-index-url https://download.pytorch.org/whl/cu121
 
 # ---------------------------------------------------------------------------
 # QA
