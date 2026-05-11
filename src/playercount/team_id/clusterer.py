@@ -1,13 +1,10 @@
 """UMAP + KMeans clusterer that turns SigLIP embeddings into team labels.
 
-The fit is one-shot per match: we pull ~150 player crops, embed them, fit
-UMAP(3) + KMeans(2), and persist the result via joblib. Inference is just
-``umap.transform`` + ``kmeans.predict``.
-
-Goalkeepers wear a different kit so they pollute the KMeans fit if included —
-the team classifier excludes them at fit time and snaps them to the nearer of
-the two team centroids at predict time (using :meth:`transform` to bring the
-GK embedding into UMAP space, then computing distances to :meth:`centroids`).
+The fit is one-shot per match: ~150 player crops → embed → UMAP(3) →
+KMeans(2), persisted with joblib. Inference is ``umap.transform`` followed
+by ``kmeans.predict``. Goalkeepers are not part of the fit (different kit);
+the team classifier handles them by snapping each one to the nearer of the
+two team centroids via :meth:`transform` and :meth:`centroids`.
 """
 
 from __future__ import annotations
@@ -15,7 +12,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
+import umap  # type: ignore[import-not-found]
+from sklearn.cluster import KMeans
 
 
 class TeamClusterer:
@@ -54,11 +54,7 @@ class TeamClusterer:
                 f"need at least {self._n_components + 1} embeddings to fit, got {n}"
             )
 
-        import umap  # type: ignore[import-not-found]
-        from sklearn.cluster import KMeans
-
-        # n_neighbors must be <= n_samples - 1; clamp to keep the fit valid
-        # on small calibration sets.
+        # n_neighbors must be <= n_samples - 1; clamp for small calibration sets.
         n_neighbors = max(2, min(15, n - 1))
         self._reducer = umap.UMAP(
             n_components=self._n_components,
@@ -103,8 +99,6 @@ class TeamClusterer:
         """Persist ``(reducer, kmeans, meta)`` to a single joblib file."""
         if not self.is_fit:
             raise RuntimeError("TeamClusterer.save called before fit()")
-        import joblib
-
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(
@@ -120,8 +114,6 @@ class TeamClusterer:
     @classmethod
     def load(cls, path: Path) -> TeamClusterer:
         """Restore a fitted clusterer from a joblib file."""
-        import joblib
-
         payload = joblib.load(Path(path))
         instance = cls(
             n_components=int(payload.get("n_components", 3)),

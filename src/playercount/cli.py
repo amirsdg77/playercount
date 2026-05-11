@@ -22,15 +22,20 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated
 
+import numpy as np
+import torch  # type: ignore[import-not-found]
 import typer
+import uvicorn
 
 from playercount import __version__
 from playercount.config import Settings, load_settings
+from playercount.constants import CLS_PLAYER
 from playercount.io.sinks import AnnotatedVideoSink, NdjsonSink
 from playercount.io.video_source import PyAvVideoSource
 from playercount.models import ModelRegistry
 from playercount.pipeline.runner import PipelineComponents, PipelineRunner
 from playercount.pipeline.stages import _crop_bgr
+from playercount.schemas import Track
 from playercount.team_id import EmbeddingTeamClassifier
 from playercount.tracking import ByteTrackTracker
 from playercount.utils import configure_logging, get_logger
@@ -107,17 +112,10 @@ def run_cmd(
     settings = load_settings(config)
     configure_logging(level=settings.log_level, json=settings.log_json)
     # CPU-only inference is slow on YOLOv8m at 1080p; smaller batches keep
-    # memory bounded and let progress show up in the NDJSON sooner. We
-    # detect GPU availability here rather than after warmup so the batch
-    # size is right from the first forward pass.
-    try:
-        import torch  # type: ignore[import-not-found]
-
-        on_cpu = settings.device == "cpu" or (
-            settings.device == "auto" and not torch.cuda.is_available()
-        )
-    except ImportError:
-        on_cpu = True
+    # memory bounded and let progress show up in the NDJSON sooner.
+    on_cpu = settings.device == "cpu" or (
+        settings.device == "auto" and not torch.cuda.is_available()
+    )
     yolo_batch = 1 if on_cpu else settings.yolo_batch_size
     settings = settings.model_copy(
         update={"sampling_stride": stride, "yolo_batch_size": yolo_batch}
@@ -236,10 +234,8 @@ async def _auto_calibrate(
     detector = registry.detector()
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playercount-cal")
     source = PyAvVideoSource(video, executor=pool)
-    import numpy as np
 
     crops: list[np.ndarray] = []
-    # Process in small batches to amortise YOLO call overhead.
     batch: list[np.ndarray] = []
     batch_size = 4
     hard_limit_frames = max(target_crops * 5, 600)
@@ -253,11 +249,9 @@ async def _auto_calibrate(
                 det_lists = detector.infer(batch)
                 for fr, dets in zip(batch, det_lists, strict=True):
                     for d in dets:
-                        if d.class_id != 0:  # players only
+                        if d.class_id != CLS_PLAYER:
                             continue
-                        # Build a fake Track to reuse _crop_bgr.
-                        from playercount.schemas import Track
-
+                        # Wrap in a Track so we can reuse _crop_bgr's clamping logic.
                         tk = Track(track_id=0, detection=d)
                         c = _crop_bgr(fr, tk)
                         if c is not None and c.size > 0:
@@ -296,8 +290,6 @@ def serve_cmd(
     workers: Annotated[int, typer.Option("--workers", min=1)] = 1,
 ) -> None:
     """Launch the HTTP service (thin uvicorn wrapper)."""
-    import uvicorn
-
     uvicorn.run(
         "playercount.api.main:create_app",
         factory=True,

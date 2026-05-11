@@ -1,29 +1,10 @@
-"""Async video source — PyAV-backed frame producer with a thread bridge.
+"""PyAV-backed async video source.
 
-PyAV is a Pythonic wrapper around ffmpeg/libav. It gives us:
-
-* In-process decode without piping ffmpeg over stdin (lower latency, no
-  process management).
-* Direct access to packet timestamps so we can emit accurate ``timestamp_s``
-  per frame even with variable frame rates.
-
-The decode loop itself is **synchronous C code** — there is no asyncio-aware
-ffmpeg in the wild. We bridge to async with the standard pattern:
-
-* A worker submitted to a single-thread executor runs ``_decode_loop``
-  synchronously: opens the container, iterates frames, converts each to BGR.
-* Each decoded frame is published to an :class:`asyncio.Queue` via
-  ``loop.call_soon_threadsafe(queue.put_nowait, ...)`` (with a backpressure
-  fallback when the queue is full — see :func:`_thread_put`).
-* The :meth:`frames` async generator awaits the queue and yields tuples,
-  staying on the event loop.
-* On consumer-side cancellation (``GeneratorExit`` / ``CancelledError``), we
-  set a :class:`threading.Event` to tell the worker to stop, drain the queue
-  to release any backpressured worker, and let the worker exit naturally.
-
-This is the only correct shape — an ``async def`` cannot ``yield`` from
-inside an executor thread. Earlier docstrings in this file described that
-impossible pattern; the audit caught it.
+PyAV decode is synchronous C code, so :class:`PyAvVideoSource` runs the
+decode loop in a worker thread and bridges to the event loop through a
+bounded :class:`asyncio.Queue`. The :meth:`PyAvVideoSource.frames` async
+generator awaits the queue and yields ``(frame_index, timestamp_s, bgr)``
+tuples.
 """
 
 from __future__ import annotations
@@ -32,15 +13,13 @@ import asyncio
 import os
 import threading
 from collections.abc import AsyncIterator
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
-if TYPE_CHECKING:
-    from concurrent.futures import ThreadPoolExecutor
-
-    import numpy as np
+import av  # type: ignore[import-not-found]
+import numpy as np
 
 
 @runtime_checkable
@@ -74,8 +53,8 @@ class PyAvVideoSource:
                 ...
             await src.close()
 
-    The executor must allow at least one worker; one is the right number for
-    a single video source (PyAV decode is single-threaded per stream).
+    The executor must allow at least one worker; one is sufficient since
+    PyAV decode is single-threaded per stream.
     """
 
     # Bounded; small because each item is a ~6 MB BGR frame at 1080p.
@@ -89,13 +68,11 @@ class PyAvVideoSource:
     ) -> None:
         self._path = Path(path)
         self._executor = executor
-        self._container: object | None = None  # av.container.InputContainer once open
-        self._stream: object | None = None  # av.video.stream.VideoStream
-        # Populated by _open()
+        self._container: object | None = None
+        self._stream: object | None = None
         self.fps: float = 0.0
         self.width: int = 0
         self.height: int = 0
-        # Lifecycle state
         self._opened = False
         self._cancel_signal = threading.Event()
         self._decode_future: Future[None] | None = None
@@ -103,13 +80,11 @@ class PyAvVideoSource:
     # -- lifecycle -----------------------------------------------------------
 
     def _open(self) -> None:
-        """Synchronously open the container and probe the video stream metadata.
+        """Open the container and populate ``fps`` / ``width`` / ``height``.
 
-        Called lazily inside the executor on the first ``frames()`` call so
-        construction itself is cheap and never blocks the event loop.
+        Called lazily inside the executor so construction never blocks the
+        event loop.
         """
-        import av  # type: ignore[import-not-found]
-
         if self._opened:
             return
         if not self._path.is_file():
@@ -120,7 +95,6 @@ class PyAvVideoSource:
             raise RuntimeError(f"no video stream in {self._path}")
         self._stream = streams[0]
         avg_rate = self._stream.average_rate  # type: ignore[attr-defined]
-        # average_rate is a Fraction; coerce safely with a fallback.
         self.fps = float(avg_rate) if avg_rate else 25.0
         cc = self._stream.codec_context  # type: ignore[attr-defined]
         self.width = int(cc.width)
@@ -136,11 +110,9 @@ class PyAvVideoSource:
         self._opened = False
 
     async def close(self) -> None:
-        """Close the underlying container off-thread and stop any decode worker."""
+        """Stop the decode worker and close the container off-thread."""
         self._cancel_signal.set()
         if self._decode_future is not None:
-            # Don't block forever — workers should exit promptly because of the
-            # cancel signal. Future.result() honours the timeout.
             with suppress(Exception):
                 await asyncio.get_running_loop().run_in_executor(
                     self._executor, self._decode_future.result, 2.0
@@ -155,13 +127,11 @@ class PyAvVideoSource:
 
     @staticmethod
     def probe(path: str | os.PathLike[str]) -> tuple[float, int, int]:
-        """Read ``(fps, width, height)`` synchronously without starting decode.
+        """Return ``(fps, width, height)`` without starting decode.
 
-        Lets callers (e.g. the CLI's annotator setup) size a VideoWriter
-        without spinning up the decode worker.
+        Useful for sizing a downstream :class:`cv2.VideoWriter` before the
+        decode worker is spun up.
         """
-        import av  # type: ignore[import-not-found]
-
         p = Path(path)
         if not p.is_file():
             raise FileNotFoundError(f"video not found: {p}")
@@ -184,9 +154,9 @@ class PyAvVideoSource:
     ) -> AsyncIterator[tuple[int, float, np.ndarray]]:
         """Yield ``(frame_index, timestamp_s, bgr_ndarray)`` tuples.
 
-        Decoding runs in the executor; the generator awaits a bounded queue
-        so backpressure from a full downstream pipeline stalls decoding
-        cleanly.
+        Decoding runs on the executor; the generator awaits a bounded queue,
+        so a slow consumer applies backpressure to the decode worker rather
+        than buffering frames in memory.
         """
         if stride < 1:
             raise ValueError(f"stride must be >= 1, got {stride}")
@@ -195,11 +165,8 @@ class PyAvVideoSource:
         queue: asyncio.Queue[tuple[int, float, np.ndarray] | None] = asyncio.Queue(
             maxsize=self._QUEUE_MAX
         )
-        # Reset cancel state for a fresh iteration
         self._cancel_signal = threading.Event()
 
-        # Submit the decode worker. It runs to completion (or until cancel)
-        # and pushes a None sentinel when it's done.
         self._decode_future = self._executor.submit(
             self._decode_loop, queue, stride, self._cancel_signal, loop
         )
@@ -208,8 +175,8 @@ class PyAvVideoSource:
             while True:
                 item = await queue.get()
                 if item is None:
-                    # Either EOF or worker stopped after a cancel signal.
-                    # Surface any worker exception by awaiting the future.
+                    # End of stream or cancelled worker; surface any worker
+                    # exception by inspecting the future.
                     if self._decode_future.done():
                         exc = self._decode_future.exception()
                         if exc is not None:
@@ -217,8 +184,6 @@ class PyAvVideoSource:
                     break
                 yield item
         except (GeneratorExit, asyncio.CancelledError):
-            # Consumer disengaged. Tell the worker to stop, drain the queue
-            # (so a worker blocked in put_nowait can return), and let it exit.
             self._cancel_signal.set()
             while True:
                 try:
@@ -236,7 +201,7 @@ class PyAvVideoSource:
         cancel_signal: threading.Event,
         loop: asyncio.AbstractEventLoop,
     ) -> None:
-        """Synchronous decode loop. Pushes frames onto the asyncio queue."""
+        """Iterate decoded frames and publish them onto ``queue``."""
         try:
             self._open()
             assert self._container is not None
@@ -255,7 +220,6 @@ class PyAvVideoSource:
                 _thread_put(loop, queue, (i, ts, bgr), cancel_signal)
                 i += 1
         finally:
-            # Push EOF so the consumer's await queue.get() resolves.
             _thread_put(loop, queue, None, cancel_signal)
 
 
@@ -270,16 +234,11 @@ def _thread_put(
     item: tuple[int, float, np.ndarray] | None,
     cancel_signal: threading.Event,
 ) -> None:
-    """Put an item on an asyncio.Queue from a worker thread.
+    """Put ``item`` on ``queue`` from a worker thread, blocking on backpressure.
 
-    We can't ``await`` on the worker thread, but we also don't want to
-    silently drop frames if the queue is full. Use
-    ``run_coroutine_threadsafe(queue.put(...), loop).result()`` so the worker
-    blocks on disk read speed when downstream is slow — that's the
-    backpressure that bounds RAM.
-
-    ``cancel_signal`` is polled every wakeup so we don't hang forever if the
-    consumer disengaged while we were blocked.
+    Uses :func:`asyncio.run_coroutine_threadsafe` so the worker waits when the
+    queue is full instead of dropping frames. ``cancel_signal`` is polled on
+    each wakeup to allow prompt teardown.
     """
     fut = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
     while not fut.done():
@@ -292,7 +251,7 @@ def _thread_put(
         except TimeoutError:
             continue
         except Exception:
-            # Loop closed or queue gone. Either way, abort the put.
+            # Loop closed or queue gone — abort.
             return
 
 

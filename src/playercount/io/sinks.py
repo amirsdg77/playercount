@@ -1,36 +1,44 @@
-"""Result sinks — JSON, NDJSON, and the annotated-MP4 eyeball-test sink.
+"""Result sinks: JSON, NDJSON, and the annotated-MP4 eyeball-test sink.
 
-All sinks share the :class:`ResultSink` protocol so the pipeline does not have
-to know whether output is going to a file, an HTTP stream, or stdout. Sinks
-are async on the surface (``write``/``aclose``) so they can plug into the
-async pipeline without blocking the loop. Synchronous file I/O happens inline
-because the per-frame payload is ~1 KB; we don't pay an executor round-trip
-for it. The MP4 sink is the exception — frame writes are dispatched to a
-ThreadPoolExecutor because OpenCV's VideoWriter blocks on disk.
+All sinks share the :class:`ResultSink` protocol so the pipeline does not
+have to know whether output is going to a file, an HTTP stream, or stdout.
+Per-frame payloads are small (~1 KB) so :class:`JsonSink` and
+:class:`NdjsonSink` perform their writes inline; :class:`AnnotatedVideoSink`
+dispatches each frame write to a :class:`ThreadPoolExecutor` because
+OpenCV's :class:`cv2.VideoWriter` blocks on disk.
 
 Each sink is owned by exactly one :func:`sink_stage` task, so no internal
-locking is needed (an earlier version used :class:`asyncio.Lock`; that was
-dead weight in a single-consumer design — see audit finding #7).
+locking is required.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Protocol, runtime_checkable
+from typing import IO, Protocol, runtime_checkable
 
-from playercount.schemas import FrameResult
+import cv2  # type: ignore[import-not-found]
+import numpy as np
 
-if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
-    from concurrent.futures import ThreadPoolExecutor
-
-    import numpy as np
-
-    from playercount.schemas import Track
-
+from playercount.constants import (
+    CLS_BALL,
+    CLS_GOALKEEPER,
+    CLS_REFEREE,
+    COLOR_GK_OUTLINE,
+    COLOR_HUD_BG,
+    COLOR_HUD_TEXT,
+    COLOR_REFEREE,
+    COLOR_TEAM_A,
+    COLOR_TEAM_B,
+    COLOR_UNASSIGNED,
+    TEAM_A,
+    TEAM_B,
+)
+from playercount.schemas import FrameResult, Track
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -167,23 +175,13 @@ class NdjsonSink:
 # ---------------------------------------------------------------------------
 
 
-# Per-team colours used by the annotator. BGR triples (OpenCV convention).
-_COLOR_TEAM_A = (0, 0, 255)  # red
-_COLOR_TEAM_B = (255, 0, 0)  # blue
-_COLOR_REFEREE = (255, 255, 255)  # white
-_COLOR_GK_OUTLINE = (0, 255, 255)  # yellow outline for GK
-
-
 class AnnotatedVideoSink:
-    """Optional sink that draws boxes + HUD on each frame and writes to MP4.
+    """Optional sink that draws boxes + HUD on each frame and writes an MP4.
 
-    Plumbing: the runner forwards ``(FrameResult, frame_bgr, tracks)`` triples
-    to :meth:`write_with_frame`. We draw team-coloured boxes, GK outlines, and
-    a top-left HUD using OpenCV (no supervision dep needed for such a simple
-    overlay), then write the frame off-thread.
-
-    Only used by the CLI (and tests). The HTTP API never produces annotated
-    video — there is nowhere to put it in a streaming response.
+    The runner forwards ``(FrameResult, frame_bgr, tracks)`` triples to
+    :meth:`write_with_frame`; the sink draws team-coloured boxes, a GK
+    outline, and a top-left HUD with OpenCV, then writes the frame off-thread.
+    Used by the CLI; the HTTP API does not produce annotated video.
     """
 
     def __init__(
@@ -213,11 +211,7 @@ class AnnotatedVideoSink:
         frame_bgr: np.ndarray,
         tracks: list[Track],
     ) -> None:
-        """Annotate ``frame_bgr`` in-place style, write to MP4 off-thread."""
-        # Lazy imports — opencv is heavy and we don't want it pulled in for
-        # every NDJSON-only run.
-        import cv2  # type: ignore[import-not-found]
-
+        """Annotate ``frame_bgr``, write to MP4 off-thread."""
         if self._writer is None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore[attr-defined]
@@ -246,42 +240,45 @@ class AnnotatedVideoSink:
         result: FrameResult,
         tracks: list[Track],
     ) -> np.ndarray:
-        """Draw team-coloured boxes + HUD onto a *copy* of the frame.
+        """Draw team-coloured boxes + HUD onto a copy of the frame.
 
-        We never mutate the caller's ndarray because the same buffer may still
-        be referenced upstream during cancellation cleanup.
+        Never mutates the caller's ndarray (the same buffer may still be
+        referenced upstream during cancellation cleanup).
         """
-        import cv2  # type: ignore[import-not-found]
-
         out = frame_bgr.copy()
 
-        # Boxes per track
         for tr in tracks:
             cls_id = tr.detection.class_id
-            if cls_id == 3:  # ball — skip
+            if cls_id == CLS_BALL:
                 continue
             x1 = int(round(tr.detection.bbox.x1))
             y1 = int(round(tr.detection.bbox.y1))
             x2 = int(round(tr.detection.bbox.x2))
             y2 = int(round(tr.detection.bbox.y2))
-            if cls_id == 2:  # referee
-                colour = _COLOR_REFEREE
-            elif tr.team_id == 0:
-                colour = _COLOR_TEAM_A
-            elif tr.team_id == 1:
-                colour = _COLOR_TEAM_B
+            if cls_id == CLS_REFEREE:
+                colour = COLOR_REFEREE
+            elif tr.team_id == TEAM_A:
+                colour = COLOR_TEAM_A
+            elif tr.team_id == TEAM_B:
+                colour = COLOR_TEAM_B
             else:
-                colour = (200, 200, 200)  # unassigned — light grey
+                colour = COLOR_UNASSIGNED
             cv2.rectangle(out, (x1, y1), (x2, y2), colour, 2)
-            if cls_id == 1:  # goalkeeper — extra yellow outline
-                cv2.rectangle(out, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), _COLOR_GK_OUTLINE, 1)
-            label = f"#{tr.track_id}"
+            if cls_id == CLS_GOALKEEPER:
+                cv2.rectangle(
+                    out, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), COLOR_GK_OUTLINE, 1
+                )
             cv2.putText(
-                out, label, (x1, max(12, y1 - 4)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1, cv2.LINE_AA,
+                out,
+                f"#{tr.track_id}",
+                (x1, max(12, y1 - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                colour,
+                1,
+                cv2.LINE_AA,
             )
 
-        # HUD
         hud = (
             f"Team A: {result.team_a_count}   "
             f"Team B: {result.team_b_count}   "
@@ -289,10 +286,11 @@ class AnnotatedVideoSink:
             f"Frame: {result.frame_index}   "
             f"t={result.timestamp_s:.2f}s"
         )
-        # Black background strip behind the HUD for legibility on light pitches.
-        cv2.rectangle(out, (0, 0), (out.shape[1], 30), (0, 0, 0), -1)
+        # Background strip behind the HUD for legibility on light pitches.
+        cv2.rectangle(out, (0, 0), (out.shape[1], 30), COLOR_HUD_BG, -1)
         cv2.putText(
-            out, hud, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA,
+            out, hud, (8, 22),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_HUD_TEXT, 1, cv2.LINE_AA,
         )
         return out
 

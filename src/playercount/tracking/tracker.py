@@ -1,10 +1,8 @@
 """Tracker protocol + ByteTrack implementation backed by ``supervision``.
 
-Why tracking matters for the count: without stable ids, a player who is briefly
-mis-detected for one frame would drop in and out of the count, producing
-flicker. Tracking turns the per-frame question "how many detections are
-visible?" into the more useful "how many distinct active tracks are visible?",
-which is robust to single-frame misses.
+Tracking turns the per-frame question "how many detections are visible?"
+into "how many distinct active track ids are visible?", which is robust to
+single-frame misses.
 
 Tracker state is per-stream and is **not** safe to share between concurrent
 analyses — :class:`playercount.pipeline.runner.PipelineRunner` constructs one
@@ -16,6 +14,7 @@ from __future__ import annotations
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
+import supervision as sv  # type: ignore[import-not-found]
 
 from playercount.schemas import CLASS_NAMES, BBox, Detection, Track
 
@@ -34,12 +33,11 @@ class Tracker(Protocol):
 
 
 class ByteTrackTracker:
-    """ByteTrack via ``supervision.ByteTrack``.
+    """ByteTrack via :class:`supervision.ByteTrack`.
 
-    We pick ByteTrack over BoT-SORT for the PoC: it's faster and ID switches on
-    short occlusions are *cheap* for our use case because the team-classifier
-    re-snaps the team label on the new track. BoT-SORT would only matter if we
-    cared about long-term identity (jersey number, possession, scouting clips).
+    ByteTrack is used over BoT-SORT because ID switches on short occlusions
+    are cheap for counting — the team classifier re-snaps the team label on
+    the new track. BoT-SORT would only matter for long-term identity.
     """
 
     def __init__(
@@ -59,12 +57,9 @@ class ByteTrackTracker:
 
     def update(self, frame_idx: int, dets: list[Detection]) -> list[Track]:
         """Translate detections → ``sv.Detections`` → ByteTrack update → :class:`Track` list."""
-        # Lazy import — supervision pulls in opencv etc. at import time.
-        import supervision as sv  # type: ignore[import-not-found]
-
         if not dets:
-            # ByteTrack still needs to be ticked so its lost-buffer counters
-            # advance; pass an empty Detections object.
+            # Tick the tracker so its lost-buffer counters advance even on
+            # empty frames.
             self._impl.update_with_detections(sv.Detections.empty())
             return []
 
@@ -105,9 +100,7 @@ class ByteTrackTracker:
         return out
 
     def reset(self) -> None:
-        """Reinitialize the underlying tracker."""
-        import supervision as sv  # type: ignore[import-not-found]
-
+        """Reinitialise the underlying tracker."""
         self._impl = sv.ByteTrack(
             track_activation_threshold=self._track_activation_threshold,
             lost_track_buffer=self._lost_track_buffer,
