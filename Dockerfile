@@ -38,8 +38,12 @@ RUN apt-get update \
 WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY src ./src
+# Pull torch / torchvision from the CPU-only wheel index so the image does
+# not ship the multi-GB CUDA libs that PyPI's default torch wheel includes.
 RUN pip install --upgrade pip \
- && pip wheel --wheel-dir /wheels ".[cpu]"
+ && pip wheel --wheel-dir /wheels \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        ".[cpu]"
 
 FROM nvidia/cuda:12.4.0-runtime-ubuntu22.04 AS builder-gpu
 ARG BASE
@@ -60,8 +64,12 @@ RUN apt-get update \
 WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY src ./src
+# Match the cu124 base image; torch's published wheel is cu121-compatible
+# with CUDA 12.4 runtime (forwards-compatible).
 RUN pip install --upgrade pip \
- && pip wheel --wheel-dir /wheels ".[gpu]"
+ && pip wheel --wheel-dir /wheels \
+        --extra-index-url https://download.pytorch.org/whl/cu121 \
+        ".[gpu]"
 
 # Pick the right builder for the BASE arg.
 FROM builder-${BASE} AS builder
