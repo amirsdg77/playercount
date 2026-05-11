@@ -1,33 +1,16 @@
-"""Pipeline orchestrator — owns queues, executors, lifecycle, and cancellation.
+"""Pipeline orchestrator: queues, executors, lifecycle, cancellation.
 
-This is the file that turns a pile of stage coroutines into a *system*.
-It is written to be readable end-to-end so the design conversation in the
-interview can lean on it directly. Two surfaces:
+Two surfaces:
 
-* :meth:`PipelineRunner.run` — drains the entire video, returns when the sink
-  has consumed the last frame.
-* :meth:`PipelineRunner.stream` — yields :class:`FrameResult` objects as they
-  are produced. Exists to feed the NDJSON streaming endpoint with no extra
-  buffering.
+* :meth:`PipelineRunner.run` drains the entire video into the configured sink.
+* :meth:`PipelineRunner.stream` yields :class:`FrameResult` items as they
+  are produced (used by the NDJSON streaming endpoint).
 
-Concurrency notes:
-
-* Stages run as siblings inside an :class:`asyncio.TaskGroup` — any failure
-  cancels the rest. We catch and re-raise the *first* underlying exception
-  rather than letting the ``ExceptionGroup`` propagate raw, since callers
-  (FastAPI, the CLI) are not written against that idiom yet.
-* **Three executors** instead of one shared pool. Detector and embedder run
-  on separate :class:`ThreadPoolExecutor` instances so a backlog in one
-  cannot starve the other; PyAV decode runs on its own single-thread pool
-  because there is exactly one video source per pipeline. Audit finding #6.
-* Bounded :class:`asyncio.Queue` instances between every pair of stages —
-  when a queue fills, ``await out_q.put(...)`` blocks the upstream stage.
-  That is the backpressure that keeps RAM bounded if the GPU is the
-  bottleneck.
-* Optional :class:`AnnotatedVideoSink` plumbed as a side-channel to the sink
-  stage. When provided, the embed stage forwards the original frame ndarray
-  through the queues; otherwise frames are dropped after embedding to save
-  memory pressure on the downstream queues.
+Stages run as siblings inside an :class:`asyncio.TaskGroup`; any failure
+cancels the rest. Detection, embedding, and decode each get their own
+:class:`ThreadPoolExecutor` so a backlog in one cannot starve the others.
+Bounded :class:`asyncio.Queue` instances between stages provide the
+backpressure that bounds memory.
 """
 
 from __future__ import annotations
@@ -66,11 +49,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class PipelineComponents:
-    """The five collaborators a :class:`PipelineRunner` needs.
-
-    Constructed by the dependency-injection layer (CLI builds them inline,
-    the API builds them from the :class:`playercount.models.registry.ModelRegistry`).
-    """
+    """The five collaborators a :class:`PipelineRunner` needs."""
 
     source: VideoSource
     detector: Detector
@@ -80,30 +59,25 @@ class PipelineComponents:
 
 
 # ---------------------------------------------------------------------------
-# Queue depths — extracted as constants so they are visible at the top of the
-# file and easy to grep / tweak. Defaults trade memory for throughput slack.
+# Queue depths
 # ---------------------------------------------------------------------------
 
-# Q1: raw 1080p BGR ≈ 6 MB/frame; 8 → ~50 MB ceiling.
+# Raw 1080p BGR ≈ 6 MB/frame; depth 8 caps decode-side memory at ~50 MB.
 _Q_DECODE_TO_DETECT = 8
-# Q2: items here are *batches* of yolo_batch_size frames; tighter cap keeps
-# decoding from running too far ahead of inference.
-_Q_DETECT_TO_EMBED = 8  # per-frame after the detect stage flushes
-# Q3: per-frame post-detect payload (tracks + crops); embedding is the typical
-# bottleneck so we keep this small.
+# Per-frame after the detect stage flushes its batch.
+_Q_DETECT_TO_EMBED = 8
+# Per-frame after embedding; embedding is typically the bottleneck.
 _Q_EMBED_TO_AGG = 8
-# Q4: results are tiny (~1 KB each); a generous buffer keeps NDJSON streaming
-# smooth even under intermittent client backpressure.
+# Final results are tiny (~1 KB each); generous buffer for streaming.
 _Q_AGG_TO_SINK = 16
 
 
 def _default_executor_workers(settings: Settings) -> int:
-    """Per-pool worker count.
+    """Worker count for the detect and embed pools.
 
-    Each of the detector and embedder pools gets ``max(2, cpu_count // 2)``
-    workers. Single CUDA context per process means real GPU parallelism is 1;
-    the extra workers exist to overlap host pre/post (resize, BGR→RGB, tensor
-    copy) with the previous batch's GPU work. Settings can override.
+    Default ``max(2, cpu_count // 2)``. Single CUDA context per process means
+    real GPU parallelism is 1; the extra workers exist to overlap host
+    pre/post-processing with the previous batch's GPU work.
     """
     if settings.executor_max_workers is not None:
         return settings.executor_max_workers
@@ -131,8 +105,8 @@ class PipelineRunner:
         self._settings = settings
         self._components = components
         self._annotator = annotator
-        # If callers pre-build executors, we don't own them and won't shut
-        # them down on aclose; the lifecycle stays with the caller.
+        # Caller-supplied executors stay under the caller's ownership; we only
+        # shut down the pools we built ourselves.
         self._owns_detect_executor = detect_executor is None
         self._owns_embed_executor = embed_executor is None
         self._owns_decode_executor = decode_executor is None
@@ -155,7 +129,7 @@ class PipelineRunner:
                 max_workers=n, thread_name_prefix="playercount-embed"
             )
         if self._decode_executor is None:
-            # PyAV decode is single-threaded per source; one worker is enough.
+            # PyAV decode is single-threaded per source.
             self._decode_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="playercount-decode"
             )
@@ -163,7 +137,6 @@ class PipelineRunner:
 
     @property
     def detect_executor(self) -> ThreadPoolExecutor:
-        """Public accessor; makes the helper sources reuse the same pool."""
         if self._detect_executor is None:
             self._ensure_executors()
         assert self._detect_executor is not None
@@ -177,7 +150,7 @@ class PipelineRunner:
         return self._decode_executor
 
     async def aclose(self) -> None:
-        """Release the source, the sink, the annotator (if any), and our pools."""
+        """Release source, sink, annotator, and any pools we own. Idempotent."""
         if self._closed:
             return
         self._closed = True
@@ -207,17 +180,14 @@ class PipelineRunner:
     async def run(self) -> None:
         """Drive the full pipeline to completion.
 
-        Returns when the sink has consumed the last frame and every stage has
-        exited cleanly. On any stage error, :meth:`aclose` is called and the
-        first underlying exception is re-raised.
+        Returns when the sink has consumed the last frame. On any stage
+        error, :meth:`aclose` is called and the first underlying exception is
+        re-raised (the wrapping ``ExceptionGroup`` is unwrapped for callers).
         """
         det_exec, emb_exec, _ = self._ensure_executors()
         c = self._components
         s = self._settings
 
-        # Stage queues are heterogeneous payload-wise; ``Any`` here lets the
-        # five stage signatures stay aligned without invariance gymnastics.
-        # See ``stages.StageQueue`` for the rationale.
         q_decode: asyncio.Queue[Any] = asyncio.Queue(maxsize=_Q_DECODE_TO_DETECT)
         q_track: asyncio.Queue[Any] = asyncio.Queue(maxsize=_Q_DETECT_TO_EMBED)
         q_assign: asyncio.Queue[Any] = asyncio.Queue(maxsize=_Q_EMBED_TO_AGG)
@@ -261,8 +231,6 @@ class PipelineRunner:
                     name="sink",
                 )
         except* Exception as eg:
-            # Unwrap to the first underlying error so callers don't have to
-            # know about ExceptionGroup.
             raise eg.exceptions[0] from None
         finally:
             await self.aclose()
@@ -272,11 +240,8 @@ class PipelineRunner:
     async def stream(self) -> AsyncIterator[FrameResult]:
         """Yield :class:`FrameResult` items as they are produced.
 
-        Used by the ``POST /analyze/stream`` endpoint to feed an NDJSON
-        StreamingResponse without buffering the whole video in memory.
-
-        Annotation is **not supported** in stream mode — there is no place to
-        write an MP4 alongside an HTTP response.
+        Used by the streaming endpoint to avoid buffering the whole video.
+        Annotation is not supported in this mode.
         """
         det_exec, emb_exec, _ = self._ensure_executors()
         s = self._settings
@@ -300,8 +265,8 @@ class PipelineRunner:
                 item = await q_results.get()
                 if item is None:
                     break
-                # Aggregator now emits (FrameResult, frame|None, tracks).
-                # In stream mode we keep_frames=False so frame is None.
+                # Aggregator emits (FrameResult, frame|None, tracks); in stream
+                # mode keep_frames=False so frame is None.
                 result, _frame, _tracks = item
                 yield result
             await producer  # surface any error
@@ -323,12 +288,7 @@ class PipelineRunner:
         det_exec: ThreadPoolExecutor,
         emb_exec: ThreadPoolExecutor,
     ) -> None:
-        """Same TaskGroup wiring as :meth:`run`, factored for the streaming case.
-
-        Note we deliberately do **not** spawn the sink stage here — the caller
-        consumes ``q_results`` directly. We *do* still need the aggregator to
-        drain into ``q_results``.
-        """
+        """TaskGroup wiring for :meth:`stream` (no sink stage; caller drains q_results)."""
         c = self._components
         s = self._settings
         try:

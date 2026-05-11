@@ -1,12 +1,11 @@
-"""SigLIP image-embedding wrapper used to vectorize player crops.
+"""SigLIP image-embedding wrapper.
 
-We use SigLIP because it produces semantically rich, lighting-robust embeddings
-that cluster well on jersey *appearance* without needing labels. The image
-tower runs on whichever device the registry chose; embeddings are L2-normalized
-so downstream UMAP / KMeans operate on the unit sphere.
+Maps player crops to L2-normalised embedding vectors. The image tower runs
+on whichever device the registry chose; output lives on the unit sphere so
+downstream UMAP / KMeans operate on cosine geometry.
 
-This wrapper is sync (one ``embed`` call per stage invocation) — it is invoked
-from a :class:`concurrent.futures.ThreadPoolExecutor` worker.
+This wrapper is synchronous (one ``embed`` call per stage invocation) and
+is invoked from a :class:`concurrent.futures.ThreadPoolExecutor` worker.
 """
 
 from __future__ import annotations
@@ -14,12 +13,15 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import torch  # type: ignore[import-not-found]
+from torch.nn import functional as torchfunc  # type: ignore[import-not-found]
+from transformers import AutoImageProcessor, AutoModel  # type: ignore[import-not-found]
 
 
 class SigLipEmbedder:
     """Batched SigLIP image-tower wrapper around a HuggingFace transformers model."""
 
-    # SigLIP-base hidden size. Used as a fallback for empty-input shape.
+    # SigLIP-base hidden size; fallback for empty-input shape.
     _DEFAULT_DIM = 768
 
     def __init__(
@@ -54,47 +56,40 @@ class SigLipEmbedder:
         return self._embed_dim
 
     def warm(self) -> None:
-        """Load weights + image processor; run a tiny dummy batch to JIT kernels."""
-        # Lazy heavy imports.
-        import torch  # type: ignore[import-not-found]
-        from transformers import AutoImageProcessor, AutoModel  # type: ignore[import-not-found]
-
+        """Load weights + image processor; run a dummy forward to JIT kernels."""
         if self._device == "auto":
             self._resolved_device = "cuda:0" if torch.cuda.is_available() else "cpu"
         else:
             self._resolved_device = self._device
 
-        # AutoImageProcessor (vs AutoProcessor) skips loading the text tokeniser
-        # — we never touch text, and SiglipTokenizer pulls in `sentencepiece`
-        # as a hard dependency we'd rather avoid for the PoC.
+        # AutoImageProcessor (not AutoProcessor) skips loading the text
+        # tokeniser, which would pull `sentencepiece` in as a hard dependency.
         self._processor = AutoImageProcessor.from_pretrained(self._model_id)  # type: ignore[no-untyped-call]
-        self._model = AutoModel.from_pretrained(self._model_id).to(self._resolved_device).eval()
+        self._model = (
+            AutoModel.from_pretrained(self._model_id).to(self._resolved_device).eval()
+        )
 
-        # Dummy forward to JIT/compile and pin memory.
-        dummy = np.zeros((8, 8, 3), dtype=np.uint8)  # tiny — processor will resize
+        dummy = np.zeros((8, 8, 3), dtype=np.uint8)
         with torch.inference_mode():
-            inputs = self._processor(images=[dummy], return_tensors="pt").to(self._resolved_device)
+            inputs = self._processor(images=[dummy], return_tensors="pt").to(
+                self._resolved_device
+            )
             feats = _extract_image_features(self._model.get_image_features(**inputs))
             self._embed_dim = int(feats.shape[-1])
 
     def embed(self, crops_bgr: list[np.ndarray]) -> np.ndarray:
-        """Return (N, D) float32 L2-normalized embeddings for ``len(crops_bgr)`` crops.
+        """Return ``(N, D)`` float32 L2-normalised embeddings.
 
-        Crops are raw BGR ndarrays of arbitrary shape (the processor handles
-        resize + normalize). Empty input returns shape ``(0, D)``.
+        Crops are raw BGR ndarrays of arbitrary shape; the processor handles
+        resize + normalise. Empty input returns shape ``(0, D)``.
         """
         if not crops_bgr:
             return np.zeros((0, self._embed_dim), dtype=np.float32)
         if self._model is None or self._processor is None:
             raise RuntimeError("SigLipEmbedder.embed called before warm()")
 
-        import torch  # type: ignore[import-not-found]
-        from torch.nn import functional as torchfunc  # type: ignore[import-not-found]
-
-        # Convert BGR → RGB once; the processor expects HxWx3 uint8 RGB.
-        # ``[:, :, ::-1]`` produces a negative-stride view that torch.from_numpy
-        # rejects in transformers 5.x — we materialise with .copy() so the
-        # processor sees a contiguous array.
+        # ``[:, :, ::-1]`` produces a negative-stride view that torch rejects;
+        # materialise with .copy() so the processor sees a contiguous array.
         rgb_crops = [c[:, :, ::-1].copy() for c in crops_bgr]
 
         all_chunks: list[np.ndarray] = []
@@ -108,25 +103,20 @@ class SigLipEmbedder:
                 feats = torchfunc.normalize(feats, dim=-1)
                 all_chunks.append(feats.detach().cpu().numpy().astype(np.float32))
 
-        return np.concatenate(all_chunks, axis=0) if all_chunks else np.zeros(
-            (0, self._embed_dim), dtype=np.float32
+        return (
+            np.concatenate(all_chunks, axis=0)
+            if all_chunks
+            else np.zeros((0, self._embed_dim), dtype=np.float32)
         )
 
 
 def _extract_image_features(out: Any) -> Any:
-    """Normalise across transformers versions.
-
-    transformers 4.x: ``get_image_features`` returns a plain tensor.
-    transformers 5.x: it returns a ``BaseModelOutputWithPooling`` whose
-    pooled embedding is at ``.pooler_output`` (shape ``(N, D)``). We accept
-    either.
-    """
+    """Normalise across transformers 4.x (returns tensor) and 5.x (returns object)."""
     if hasattr(out, "shape"):
-        return out  # tensor
+        return out
     if hasattr(out, "pooler_output") and out.pooler_output is not None:
         return out.pooler_output
     if hasattr(out, "last_hidden_state"):
-        # Fallback: mean-pool over patches.
         return out.last_hidden_state.mean(dim=1)
     raise RuntimeError(
         f"unexpected get_image_features return type: {type(out).__name__}"

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -323,9 +324,7 @@ async def analyze(
     _ensure_ready(registry)
     parsed, upload = await _parse_analyze_input(request)
 
-    # Build a one-worker decode pool so the source can publish frames.
-    from concurrent.futures import ThreadPoolExecutor
-
+    # One-worker decode pool so the source can publish frames.
     decode_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playercount-decode-api")
     source, tmp_path = await _materialise_source(parsed, upload, decode_pool)
 
@@ -366,8 +365,6 @@ async def analyze_stream(
     """Run the pipeline streaming, returning NDJSON over chunked transfer."""
     _ensure_ready(registry)
     parsed, upload = await _parse_analyze_input(request)
-
-    from concurrent.futures import ThreadPoolExecutor
 
     decode_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playercount-decode-api")
     source, tmp_path = await _materialise_source(parsed, upload, decode_pool)
